@@ -1,0 +1,81 @@
+name: Build and Push Frontend Image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  typecheck:
+    name: TypeScript check
+    # typecheck 不需要 push image，可跑在 cloud runner 節省 bastion 資源
+    # 若無 cloud runner 授權，改為 [self-hosted, bastion, linux]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript check
+        run: npx tsc --noEmit
+
+      - name: Vite build check
+        run: npm run build
+
+  build:
+    name: Build ${{ github.event_name == 'pull_request' && '(PR - no push)' || '' }}
+    runs-on: [self-hosted, bastion, linux]
+    needs: typecheck
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
+
+      - name: Login to mirror-registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.REGISTRY_HOST }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.REGISTRY_HOST }}/ocp-automation/ocp-automation-frontend
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=pr
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ secrets.REGISTRY_HOST }}/ocp-automation/ocp-automation-frontend:buildcache
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}/ocp-automation/ocp-automation-frontend:buildcache,mode=max', secrets.REGISTRY_HOST) || '' }}
+
+      - name: Logout
+        if: always() && github.event_name != 'pull_request'
+        run: docker logout ${{ secrets.REGISTRY_HOST }}
